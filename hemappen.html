@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="robots" content="noindex, nofollow, noarchive, nosnippet">
+<meta name="googlebot" content="noindex, nofollow">
 <title>Hemappen</title>
 <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet">
 <style>
@@ -377,8 +379,11 @@ body {
 <div class="app-header">
   <div class="header-top">
     <div class="app-name">🏠 Hemappen</div>
-    <div style="display:flex;align-items:center;gap:8px">
-      <div class="header-date" id="header-date"></div>
+    <div style="display:flex;align-items:center;gap:8px;flex-direction:column;align-items:flex-end">
+      <div style="display:flex;align-items:center;gap:6px">
+        <span id="sync-status" style="font-size:0.68rem;font-weight:700;opacity:0;transition:opacity 0.4s"></span>
+        <div class="header-date" id="header-date"></div>
+      </div>
       <div class="active-user-chip" id="active-user-chip" onclick="showSplash()" title="Byt användare"></div>
     </div>
   </div>
@@ -656,26 +661,113 @@ let state = {
   persons: { p1: 'Sanna', p2: 'Victor' }
 };
 
-// ── STORAGE ──
-function save() { localStorage.setItem('hemappen', JSON.stringify(state)); }
-function load() {
-  const d = localStorage.getItem('hemappen');
-  if (d) {
-    const parsed = JSON.parse(d);
-    const persons = parsed.persons || { p1: 'Sanna', p2: 'Victor' };
-    if (persons.p1 === 'Person 1') persons.p1 = 'Sanna';
-    if (persons.p2 === 'Person 2') persons.p2 = 'Victor';
-    state = {
-      bills: parsed.bills || [],
-      goals: parsed.goals || [],
-      foodBudget: parsed.foodBudget || 0,
-      foodItems: parsed.foodItems || [],
-      shopItems: parsed.shopItems || [],
-      events: parsed.events || [],
-      persons
-    };
+// ── SUPABASE SYNC ──
+const SUPA_URL = 'https://yqmzdidhaeplmacxqalq.supabase.co';
+const SUPA_KEY = 'sb_publishable_jLdTWaWP0VwXhZDsj36uZQ_qFVc18B7';
+const SUPA_TABLE = 'app_state';
+const SUPA_ROW_ID = 1;
+let syncTimeout = null;
+let lastSyncedAt = null;
+
+async function supaFetch(method, body) {
+  const url = `${SUPA_URL}/rest/v1/${SUPA_TABLE}?id=eq.${SUPA_ROW_ID}`;
+  const res = await fetch(method === 'GET' ? `${SUPA_URL}/rest/v1/${SUPA_TABLE}?id=eq.${SUPA_ROW_ID}&select=data,updated_at` : url, {
+    method,
+    headers: {
+      'apikey': SUPA_KEY,
+      'Authorization': `Bearer ${SUPA_KEY}`,
+      'Content-Type': 'application/json',
+      'Prefer': method === 'POST' ? 'return=representation,resolution=merge-duplicates' : 'return=representation'
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function saveToCloud() {
+  localStorage.setItem('hemappen', JSON.stringify(state));
+  try {
+    await supaFetch('POST', { id: SUPA_ROW_ID, data: state, updated_at: new Date().toISOString() });
+    showSyncStatus('✓ Synkad', '#06d6a0');
+  } catch(e) {
+    showSyncStatus('⚠ Offline', '#ffa62b');
   }
 }
+
+async function loadFromCloud() {
+  // First load from localStorage for instant render
+  const local = localStorage.getItem('hemappen');
+  if (local) applyParsed(JSON.parse(local));
+
+  try {
+    const rows = await supaFetch('GET');
+    if (rows && rows.length && rows[0].data) {
+      const remote = rows[0].data;
+      lastSyncedAt = rows[0].updated_at;
+      applyParsed(remote);
+      localStorage.setItem('hemappen', JSON.stringify(state));
+    }
+  } catch(e) {
+    showSyncStatus('⚠ Offline – lokalt läge', '#ffa62b');
+  }
+}
+
+function applyParsed(parsed) {
+  const persons = parsed.persons || { p1: 'Sanna', p2: 'Victor' };
+  if (persons.p1 === 'Person 1') persons.p1 = 'Sanna';
+  if (persons.p2 === 'Person 2') persons.p2 = 'Victor';
+  state = {
+    bills: parsed.bills || [],
+    goals: parsed.goals || [],
+    foodBudget: parsed.foodBudget || 0,
+    foodItems: parsed.foodItems || [],
+    shopItems: parsed.shopItems || [],
+    events: parsed.events || [],
+    persons
+  };
+}
+
+function save() {
+  localStorage.setItem('hemappen', JSON.stringify(state));
+  clearTimeout(syncTimeout);
+  syncTimeout = setTimeout(saveToCloud, 800); // debounce 800ms
+}
+
+function load() {
+  const local = localStorage.getItem('hemappen');
+  if (local) applyParsed(JSON.parse(local));
+}
+
+function showSyncStatus(msg, color) {
+  let el = document.getElementById('sync-status');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = color;
+  el.style.opacity = '1';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.style.opacity = '0', 3000);
+}
+
+// Live polling — check for remote changes every 10s
+function startLiveSync() {
+  setInterval(async () => {
+    try {
+      const rows = await supaFetch('GET');
+      if (rows && rows.length && rows[0].updated_at !== lastSyncedAt) {
+        lastSyncedAt = rows[0].updated_at;
+        const remote = rows[0].data;
+        applyParsed(remote);
+        localStorage.setItem('hemappen', JSON.stringify(state));
+        injectNewcastleFixtures();
+        renderBills(); renderGoals(); renderFood(); renderShop(); renderCal(); updateDashboard();
+        updatePersonLabels(); applyDevicePerson();
+        showSyncStatus('↓ Uppdaterad', '#748ffc');
+      }
+    } catch(e) { /* silent */ }
+  }, 10000);
+}
+
 
 // ── NAVIGATION ──
 function gotoScreen(name) {
@@ -1401,16 +1493,33 @@ document.getElementById('food-item-name').addEventListener('keydown', e => { if(
 document.getElementById('header-date').textContent = new Date().toLocaleDateString('sv-SE', { weekday:'long', day:'numeric', month:'long' });
 
 // ── INIT ──
-load();
-injectNewcastleFixtures();
-updatePersonLabels();
-initDevicePerson();
-renderBills();
-renderGoals();
-renderFood();
-renderShop();
-initCal();
-updateDashboard();
+async function init() {
+  load(); // instant local render
+  injectNewcastleFixtures();
+  updatePersonLabels();
+  initDevicePerson();
+  renderBills();
+  renderGoals();
+  renderFood();
+  renderShop();
+  initCal();
+  updateDashboard();
+
+  await loadFromCloud(); // fetch latest from Supabase
+  injectNewcastleFixtures();
+  updatePersonLabels();
+  applyDevicePerson();
+  renderBills();
+  renderGoals();
+  renderFood();
+  renderShop();
+  initCal();
+  updateDashboard();
+
+  startLiveSync(); // poll every 10s for changes from other device
+}
+
+init();
 </script>
 </body>
 </html>
